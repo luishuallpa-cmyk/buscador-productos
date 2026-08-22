@@ -199,6 +199,54 @@
             }
         });
 
+        // ---- Carga diferida de librerías pesadas (Excel / ZIP / escáner) ----
+        var _iemLibPromises = Object.create(null);
+        function loadScriptOnce(url) {
+            if (!url) return Promise.reject(new Error('URL de script vacía'));
+            if (_iemLibPromises[url]) return _iemLibPromises[url];
+            _iemLibPromises[url] = new Promise(function (resolve, reject) {
+                var s = document.createElement('script');
+                s.src = url;
+                s.async = true;
+                s.onload = function () { resolve(); };
+                s.onerror = function () {
+                    delete _iemLibPromises[url];
+                    reject(new Error('No se pudo cargar: ' + url));
+                };
+                document.head.appendChild(s);
+            });
+            return _iemLibPromises[url];
+        }
+        function cfgCdn(key, fallback) {
+            try {
+                var c = window.IEM_CONFIG || {};
+                return c[key] || fallback;
+            } catch (e) { return fallback; }
+        }
+        async function ensureXlsx() {
+            if (typeof XLSX !== 'undefined') return true;
+            await loadScriptOnce(cfgCdn('CDN_XLSX', 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js'));
+            if (typeof XLSX === 'undefined') throw new Error('XLSX no disponible');
+            return true;
+        }
+        async function ensureJSZip() {
+            if (typeof JSZip !== 'undefined') return true;
+            await loadScriptOnce(cfgCdn('CDN_JSZIP', 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js'));
+            if (typeof JSZip === 'undefined') throw new Error('JSZip no disponible');
+            return true;
+        }
+        async function ensureHtml5Qrcode() {
+            if (typeof Html5Qrcode !== 'undefined') return true;
+            await loadScriptOnce(cfgCdn('CDN_HTML5_QRCODE', 'https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js'));
+            if (typeof Html5Qrcode === 'undefined') throw new Error('Html5Qrcode no disponible');
+            return true;
+        }
+        try {
+            window.ensureXlsx = ensureXlsx;
+            window.ensureJSZip = ensureJSZip;
+            window.ensureHtml5Qrcode = ensureHtml5Qrcode;
+        } catch (eW) {}
+
         const GOOGLE_SHEETS_CSV_URL = '';
         const SCRIPT_URL = '';
 
@@ -346,6 +394,11 @@
                     .eq('id', idSesionActual)
                     .maybeSingle();
                 if (data && data.forzar_cierre) {
+                    // Releer una vez para evitar falso positivo de red/caché
+                    try {
+                        var chk = await supabaseClient.from('sesiones_activas').select('forzar_cierre').eq('id', idSesionActual).maybeSingle();
+                        if (!(chk && chk.data && chk.data.forzar_cierre)) return;
+                    } catch (eChk) {}
                     forzarLogoutLocal('El administrador cerró tu sesión.');
                     return;
                 }
@@ -538,6 +591,38 @@
                     '<br><small>¿Ejecutaste el SQL de sesiones_activas?</small></p>';
             }
         }
+
+        /** Borra sesiones con ping > 5 min o con cierre forzado pendiente (excepto la de este dispositivo). */
+        async function limpiarSesionesInactivas() {
+            if (typeof esAdmin === 'function' && !esAdmin()) {
+                showToast('Solo administrador.', 'error');
+                return;
+            }
+            const ok = await confirmarAccion(
+                '¿Eliminar de la lista las sesiones inactivas (sin ping en 5 min) y las que ya tienen cierre pendiente? No cierra la tuya.',
+                'Limpiar',
+                'danger'
+            );
+            if (!ok) return;
+            try {
+                const limite = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+                var q1 = supabaseClient.from('sesiones_activas').delete().lt('ultimo_ping', limite);
+                if (idSesionActual) q1 = q1.neq('id', idSesionActual);
+                const r1 = await q1;
+                var q2 = supabaseClient.from('sesiones_activas').delete().eq('forzar_cierre', true);
+                if (idSesionActual) q2 = q2.neq('id', idSesionActual);
+                const r2 = await q2;
+                if (r1.error || r2.error) {
+                    showToast('Error al limpiar: ' + ((r1.error || r2.error).message || ''), 'error');
+                } else {
+                    showToast('Sesiones inactivas limpiadas.', 'success');
+                }
+                cargarSesionesActivas();
+            } catch (e) {
+                showToast('Error al limpiar: ' + (e.message || e), 'error');
+            }
+        }
+        try { window.__limpiarSesionesInactivas = limpiarSesionesInactivas; } catch (eW) {}
 
         // DOM
         const searchInput = document.getElementById('searchInput');
@@ -801,7 +886,9 @@
             });
             var finalList = otros.concat(Object.keys(byDayExcel).map(function (k) { return byDayExcel[k]; }));
 
-            if (typeof JSZip === 'undefined') {
+            try {
+                await ensureJSZip();
+            } catch (eZip) {
                 if (!silencioso) showToast('JSZip no cargó; usa los Excel sueltos descargados.', 'info');
                 return;
             }
@@ -2373,7 +2460,8 @@
             }));
         }
 
-        function exportarPedido() {
+        async function exportarPedido() {
+            try { await ensureXlsx(); } catch (eX) { showToast('No se pudo cargar Excel (XLSX).', 'error'); return; }
             if (!esAdmin()) {
                 showToast('Solo el administrador puede descargar el Excel del pedido.', 'error');
                 return;
@@ -3877,6 +3965,7 @@
         }
 
         async function descargarInventarioEnviadoExcel(id) {
+            try { await ensureXlsx(); } catch (eX) { showToast('No se pudo cargar Excel (XLSX).', 'error'); return; }
             if (!esAdmin()) return;
             showToast('⏳ Preparando Excel del envío…', 'info');
             try {
@@ -3930,6 +4019,7 @@
         }
 
         async function exportarInventario() {
+            try { await ensureXlsx(); } catch (eX) { showToast('No se pudo cargar Excel (XLSX).', 'error'); return; }
             // Disponible para admin y usuarios de conteo (guardar su conteo terminado)
             if (typeof esVendedor === 'function' && esVendedor() && !esAdmin()) {
                 showToast('No disponible en modo vendedor.', 'error');
@@ -4941,7 +5031,9 @@
             });
             var finalList = otros.concat(Object.keys(byDayExcel).map(function (k) { return byDayExcel[k]; }));
             if (!finalList.length) return { ok: false, motivo: 'sin_tipo' };
-            if (typeof JSZip === 'undefined') {
+            try {
+                await ensureJSZip();
+            } catch (eZip) {
                 // fallback: último archivo suelto
                 var last = finalList[finalList.length - 1];
                 var url0 = URL.createObjectURL(last.blob);
@@ -4993,7 +5085,7 @@
                     d.fecha || ''
                 ]);
             });
-            if (typeof XLSX === 'undefined') return null;
+            try { await ensureXlsx(); } catch (eX) { return null; }
             var wb = XLSX.utils.book_new();
             var ws = XLSX.utils.aoa_to_sheet(filas);
             XLSX.utils.book_append_sheet(wb, ws, 'Conteo');
@@ -5616,6 +5708,7 @@
         }
 
         async function importarExcelASupabase(file, opciones) {
+            try { await ensureXlsx(); } catch (eX) { showToast('No se pudo cargar Excel (XLSX).', 'error'); return; }
             if (!file) return;
             if (typeof esAdmin === 'function' && !esAdmin()) {
                 showToast('Solo el administrador puede importar el Excel.', 'error');
@@ -6209,7 +6302,9 @@
                 showToast('El escáner no está habilitado para este usuario.', 'error');
                 return;
             }
-            if (typeof Html5Qrcode === 'undefined') {
+            try {
+                await ensureHtml5Qrcode();
+            } catch (eQr) {
                 showToast('No se cargó el lector. Revisa tu conexión.', 'error');
                 return;
             }
@@ -6628,8 +6723,10 @@
                 return;
             }
             if (!file) return;
-            if (typeof XLSX === 'undefined') {
-                showToast('No se cargó la librería Excel. Recarga la página.', 'error');
+            try {
+                await ensureXlsx();
+            } catch (eX) {
+                showToast('No se cargó la librería Excel. Revisa tu conexión.', 'error');
                 return;
             }
             const box = document.getElementById('adminClientesImportBox');
@@ -7193,6 +7290,13 @@
                     cargarSesionesActivas();
                 });
             }
+            const adminLimpiarSesionesBtn = document.getElementById('adminLimpiarSesionesBtn');
+            if (adminLimpiarSesionesBtn) {
+                adminLimpiarSesionesBtn.addEventListener('click', function () {
+                    if (!esAdmin()) return;
+                    if (typeof limpiarSesionesInactivas === 'function') limpiarSesionesInactivas();
+                });
+            }
 
             // Sincronización en vivo del conteo compartido entre celulares.
             sincronizarDesdeServidor();
@@ -7479,9 +7583,10 @@
 
         const SESSION_KEY = 'iem_sesion_activa';
         const AUTH_EMAIL_DOMAIN = 'iem.local'; // luis → luis@iem.local
-        // Sesión válida con actividad en los últimos 20 minutos.
+        // Sesión válida con actividad reciente (8 h de jornada).
         // F5 / recarga NO debe cerrar sesión si aún no venció la inactividad.
-        const SESSION_IDLE_MS = 20 * 60 * 1000;
+        // Antes: 20 min → en PC se cerraba solo al dejar de hacer clic un rato.
+        const SESSION_IDLE_MS = 8 * 60 * 60 * 1000;
 
         // Aplicar clase vendedor desde la URL lo antes posible
         (function () {
@@ -7548,7 +7653,7 @@
                 if (!raw) return null;
                 const data = JSON.parse(raw);
                 if (!data || !data.ts) return null;
-                // Solo inactividad (20 min). No validamos deviceId aquí para que F5 no cierre sesión.
+                // Solo inactividad (SESSION_IDLE_MS). No validamos deviceId aquí para que F5 no cierre sesión.
                 if (Date.now() - data.ts > SESSION_IDLE_MS) return null;
                 return data;
             } catch (e) {
@@ -7607,6 +7712,11 @@
             document.body.classList.toggle('modo-vendedor', !!vend && !es);
             const menuWrap = document.getElementById('headerMenuWrap');
             if (menuWrap) menuWrap.style.display = es ? '' : 'none';
+            var fabCalc = document.getElementById('fabCalc');
+            if (fabCalc) {
+                if (es) fabCalc.removeAttribute('hidden');
+                else fabCalc.setAttribute('hidden', '');
+            }
             // Excel: disponible para admin y usuarios de conteo (guardar su conteo terminado)
             const exportBtn = document.getElementById('exportDiffBtn');
             if (exportBtn) exportBtn.style.display = (es || !vend) ? '' : 'none';
@@ -7872,7 +7982,7 @@
         function mostrarLogin() {
             try {
                 var lv = document.getElementById('loginVersion');
-                if (lv) lv.textContent = 'v' + ((window.IEM && IEM.VERSION) || '4.9.2');
+                if (lv) lv.textContent = 'v' + ((window.IEM && IEM.VERSION) || '4.9.3');
             } catch (eVer) {}
 
             try {
@@ -8301,7 +8411,7 @@
 
         // Arranque: si Supabase Auth tiene sesión válida → entrar SIEMPRE.
         // F5 / recarga / pull-to-refresh ("jalar") NO debe cerrar sesión.
-        // La inactividad de 20 min solo aplica con la app YA abierta, no al recargar.
+        // La inactividad (SESSION_IDLE_MS) solo aplica con la app YA abierta, no al recargar.
         let authBootDone = false;
         let arranqueEnCurso = true;
 
@@ -8362,17 +8472,31 @@
                 if (event === 'SIGNED_OUT') {
                     if (!authBootDone || arranqueEnCurso) return;
                     if (!usuarioActual) return;
-                    // Si hay meta local o aún hay token en storage, no cerrar (falso positivo)
+                    // Falso positivo frecuente en PC (refresh de token / pestaña en segundo plano)
                     if (leerMetaSesion()) {
                         console.warn('SIGNED_OUT ignorado: meta de sesión aún válida');
                         return;
                     }
-                    usuarioActual = '';
-                    rolUsuario = '';
-                    try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
-                    if (appContainer && !appContainer.classList.contains('oculto')) {
-                        mostrarLogin();
-                    }
+                    // Intentar recuperar sesión de Auth antes de echar al usuario
+                    (async function () {
+                        try {
+                            var res = await supabaseClient.auth.getSession();
+                            var sess = res && res.data && res.data.session;
+                            if (sess && sess.user) {
+                                console.warn('SIGNED_OUT ignorado: getSession aún tiene usuario');
+                                tocarSesion();
+                                return;
+                            }
+                        } catch (eR) {}
+                        if (!usuarioActual) return;
+                        usuarioActual = '';
+                        rolUsuario = '';
+                        try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
+                        if (appContainer && !appContainer.classList.contains('oculto')) {
+                            showToast('Sesión finalizada. Vuelve a entrar.', 'info');
+                            mostrarLogin();
+                        }
+                    })();
                 } else if ((event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'INITIAL_SESSION') && session) {
                     if (usuarioActual) {
                         tocarSesion();
@@ -8385,29 +8509,55 @@
             });
         } catch (e) {}
 
-        // Renovar actividad con uso real (clics, teclas, toques, scroll)
-        ['click', 'keydown', 'touchstart', 'pointerdown', 'scroll'].forEach(function (ev) {
-            document.addEventListener(ev, function () {
-                if (usuarioActual) tocarSesion();
-            }, { passive: true, capture: true });
+        // Renovar actividad con uso real (incluye mouse en PC)
+        var _tocarThrottle = 0;
+        function tocarSesionThrottled() {
+            if (!usuarioActual) return;
+            var now = Date.now();
+            if (now - _tocarThrottle < 15000) return; // máx 1 vez / 15 s
+            _tocarThrottle = now;
+            tocarSesion();
+        }
+        ['click', 'keydown', 'touchstart', 'pointerdown', 'scroll', 'mousemove', 'wheel'].forEach(function (ev) {
+            document.addEventListener(ev, tocarSesionThrottled, { passive: true, capture: true });
         });
-
-        // Cierre solo por inactividad real (20 min sin tocar la app YA ABIERTA).
-        // Nunca aplica en los primeros segundos tras recargar.
-        var appAbiertaDesde = Date.now();
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'visible' && usuarioActual) tocarSesion();
+        });
+        // Heartbeat: mientras la pestaña está visible, mantener meta viva
         setInterval(function () {
-            if (Date.now() - appAbiertaDesde < 60000) return; // 1 min de gracia tras cargar
+            if (document.visibilityState !== 'visible') return;
+            if (!usuarioActual) return;
+            if (appContainer && appContainer.classList.contains('oculto')) return;
+            tocarSesion();
+        }, 5 * 60 * 1000);
+
+        // Cierre por inactividad SOLO si meta local venció Y Supabase ya no tiene sesión.
+        // Si el token de Auth sigue vivo, renovamos la meta (evita cierre falso en PC).
+        var appAbiertaDesde = Date.now();
+        setInterval(async function () {
+            if (Date.now() - appAbiertaDesde < 60000) return;
             if (arranqueEnCurso) return;
-            if (!appContainer.classList.contains('oculto') && usuarioActual && !leerMetaSesion()) {
-                borrarSesionActiva();
-                try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
-                try { supabaseClient.auth.signOut(); } catch (e) {}
-                usuarioActual = '';
-                rolUsuario = '';
-                showToast('Sesión cerrada por inactividad (20 min).', 'info');
-                mostrarLogin();
-            }
-        }, 30000);
+            if (!usuarioActual) return;
+            if (appContainer && appContainer.classList.contains('oculto')) return;
+            if (leerMetaSesion()) return;
+            // Meta vencida: ¿sigue habiendo sesión de Auth?
+            try {
+                var res = await supabaseClient.auth.getSession();
+                var sess = res && res.data && res.data.session;
+                if (sess && sess.user) {
+                    tocarSesion(); // renueva sin echar al usuario
+                    return;
+                }
+            } catch (e) {}
+            borrarSesionActiva();
+            try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
+            try { supabaseClient.auth.signOut(); } catch (e) {}
+            usuarioActual = '';
+            rolUsuario = '';
+            showToast('Sesión cerrada por inactividad.', 'info');
+            mostrarLogin();
+        }, 60000);
 
         // ============================================================
         // PEDIDOS SUGERIDOS (PWA vendedores → admin)
@@ -8689,28 +8839,6 @@
 
 
 
-        // Cierre por inactividad (20 min)
-        const INACTIVIDAD_MS = 20 * 60000;
-        let ultimoUso = Date.now();
-
-        function marcarActividad() {
-            ultimoUso = Date.now();
-        }
-
-        ['click', 'touchstart', 'keydown', 'scroll', 'mousemove'].forEach(ev => {
-            document.addEventListener(ev, marcarActividad, { passive: true });
-        });
-
-        setInterval(() => {
-            if (!appContainer.classList.contains('oculto') && Date.now() - ultimoUso >= INACTIVIDAD_MS) {
-                borrarSesionActiva();
-                try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
-                try { supabaseClient.auth.signOut(); } catch (e) {}
-                usuarioActual = '';
-                rolUsuario = '';
-                mostrarLogin();
-            }
-        }, 60000);
     })();
 
 
@@ -8727,6 +8855,30 @@
                 window.cambiarTabAdmin('vencimientos');
             }
         });
+
+
+        // Asegurar que la lista de resultados vacía no bloquee scroll del inventario
+        (function collapseEmptyResults() {
+            function run() {
+                try {
+                    var rl = document.getElementById('resultList');
+                    var rs = document.getElementById('resultsSection');
+                    var si = document.getElementById('searchInput');
+                    var term = (si && si.value) ? si.value.trim() : '';
+                    if (!term && rl) {
+                        rl.innerHTML = '';
+                        rl.classList.add('result-list-collapsed');
+                        rl.classList.remove('result-list-open');
+                        document.body.classList.remove('search-open');
+                        if (rs) rs.classList.remove('has-results');
+                    }
+                } catch (e) {}
+            }
+            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', run);
+            else run();
+            setTimeout(run, 400);
+            setTimeout(run, 1200);
+        })();
 
         // Pull-to-refresh en la zona superior (móvil): recarga limpia de caché
         (function initPullToRefresh() {
@@ -8832,7 +8984,7 @@
                 // Solo si el dedo empieza en la franja superior
                 if (y > topZonePx()) return;
                 var t = e.target;
-                if (t && t.closest && t.closest('input, textarea, select, button, a, .header-menu-dropdown, .panel-alerta-venc, .result-item')) return;
+                if (t && t.closest && t.closest('input, textarea, select, button, a, .header-menu-dropdown, .panel-alerta-venc, .result-item, #diffMobileList, #diffCardBody, .mi-card, #calcOverlay, .fab-calc, .fab-alerta-venc')) return;
                 startY = y;
                 pulling = true;
                 armed = false;
@@ -8874,6 +9026,179 @@
                 hideIndicator();
             }, { passive: true });
         })();
+
+
+        // ============================================================
+        // Calculadora rápida (admin) → poner resultado en cajas/unidades
+        // ============================================================
+        (function initCalculadoraIEM() {
+            var fab = document.getElementById('fabCalc');
+            var ov = document.getElementById('calcOverlay');
+            var display = document.getElementById('calcDisplay');
+            var exprEl = document.getElementById('calcExpr');
+            if (!fab || !ov || !display) return;
+
+            var expr = '';
+            var justEvaluated = false;
+
+            function setDisplay(v) {
+                display.textContent = v === '' || v == null ? '0' : String(v);
+            }
+            function setExpr(v) {
+                if (exprEl) exprEl.textContent = v || '';
+            }
+            function openCalc() {
+                ov.hidden = false;
+                ov.setAttribute('aria-hidden', 'false');
+            }
+            function closeCalc() {
+                ov.hidden = true;
+                ov.setAttribute('aria-hidden', 'true');
+            }
+            function currentValue() {
+                var t = (display.textContent || '0').replace(/\s/g, '');
+                var n = parseFloat(t);
+                return isFinite(n) ? n : 0;
+            }
+            /** Evalúa solo dígitos y + - * / % . ( ) de forma segura */
+            function safeEval(s) {
+                s = String(s || '').replace(/×/g, '*').replace(/÷/g, '/').replace(/−/g, '-');
+                s = s.replace(/\s/g, '');
+                if (!s) return 0;
+                if (!/^[0-9+\-*/%.()]+$/.test(s)) throw new Error('expr');
+                // evita letras / código
+                var fn = new Function('return (' + s + ');');
+                var r = fn();
+                if (typeof r !== 'number' || !isFinite(r)) throw new Error('nan');
+                return r;
+            }
+            function formatResult(n) {
+                if (Math.abs(n - Math.round(n)) < 1e-9) return String(Math.round(n));
+                var s = String(Math.round(n * 1e6) / 1e6);
+                return s;
+            }
+            function evaluate() {
+                try {
+                    var src = expr || display.textContent;
+                    var r = safeEval(src);
+                    setExpr(src + ' =');
+                    setDisplay(formatResult(r));
+                    expr = formatResult(r);
+                    justEvaluated = true;
+                } catch (e) {
+                    setDisplay('Error');
+                    expr = '';
+                    justEvaluated = true;
+                }
+            }
+            function press(k) {
+                if (k === 'C') {
+                    expr = '';
+                    justEvaluated = false;
+                    setDisplay('0');
+                    setExpr('');
+                    return;
+                }
+                if (k === '⌫') {
+                    if (justEvaluated) {
+                        expr = '';
+                        setDisplay('0');
+                        setExpr('');
+                        justEvaluated = false;
+                        return;
+                    }
+                    expr = expr.slice(0, -1);
+                    setDisplay(expr || '0');
+                    return;
+                }
+                if (k === '=') {
+                    evaluate();
+                    return;
+                }
+                if (justEvaluated && /[0-9.]/.test(k)) {
+                    expr = '';
+                    justEvaluated = false;
+                }
+                if (justEvaluated && /[+\-*/%]/.test(k)) {
+                    justEvaluated = false;
+                }
+                // un solo punto en el número actual
+                if (k === '.') {
+                    var parts = expr.split(/[+\-*/%]/);
+                    var last = parts[parts.length - 1] || '';
+                    if (last.indexOf('.') !== -1) return;
+                    if (!last) expr += '0';
+                }
+                expr += k;
+                setDisplay(expr);
+                setExpr('');
+            }
+            function putInto(inputId) {
+                var el = document.getElementById(inputId);
+                if (!el) {
+                    if (typeof showToast === 'function') showToast('Campo no disponible.', 'error');
+                    return;
+                }
+                if (el.disabled) {
+                    if (typeof showToast === 'function') showToast('Selecciona un producto primero.', 'info');
+                    return;
+                }
+                var n = currentValue();
+                if (n < 0) n = 0;
+                // enteros para cajas/unidades de conteo
+                var v = (inputId === 'txtCajas' || inputId === 'txtUnidades')
+                    ? String(Math.max(0, Math.round(n)))
+                    : formatResult(n);
+                el.value = v;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                try { el.focus(); } catch (e) {}
+                if (typeof showToast === 'function') {
+                    showToast('Puesto en ' + (inputId === 'txtCajas' ? 'Cajas' : inputId === 'txtUnidades' ? 'Unidades' : inputId) + ': ' + v, 'success');
+                }
+                closeCalc();
+            }
+            function putFocus() {
+                var a = document.activeElement;
+                if (a && (a.id === 'txtCajas' || a.id === 'txtUnidades') && !a.disabled) {
+                    putInto(a.id);
+                    return;
+                }
+                // por defecto cajas si están habilitadas
+                var c = document.getElementById('txtCajas');
+                if (c && !c.disabled) {
+                    putInto('txtCajas');
+                    return;
+                }
+                var u = document.getElementById('txtUnidades');
+                if (u && !u.disabled) {
+                    putInto('txtUnidades');
+                    return;
+                }
+                if (typeof showToast === 'function') showToast('Selecciona un producto y enfoca Cajas o Unidades.', 'info');
+            }
+
+            fab.addEventListener('click', function () {
+                openCalc();
+            });
+            var closeBtn = document.getElementById('calcCloseBtn');
+            if (closeBtn) closeBtn.addEventListener('click', closeCalc);
+            ov.addEventListener('click', function (e) {
+                if (e.target === ov) closeCalc();
+            });
+            ov.querySelectorAll('.calc-key').forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    press(btn.getAttribute('data-k') || '');
+                });
+            });
+            var toC = document.getElementById('calcToCajas');
+            var toU = document.getElementById('calcToUnidades');
+            var toF = document.getElementById('calcToFocus');
+            if (toC) toC.addEventListener('click', function () { putInto('txtCajas'); });
+            if (toU) toU.addEventListener('click', function () { putInto('txtUnidades'); });
+            if (toF) toF.addEventListener('click', putFocus);
+        })();
+
 
         // Al reabrir la app: pedir SW actualizado y recargar una vez si hay versión nueva
         (function initSwUpdate() {
